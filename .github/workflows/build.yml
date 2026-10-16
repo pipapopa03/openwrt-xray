@@ -1,0 +1,99 @@
+name: Build xray for OpenWrt (filogic / aarch64_cortex-a53)
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'Версия OpenWrt (как в /etc/openwrt_release), напр. 25.12.5 или 24.10.4'
+        required: true
+        default: '25.12.5'
+      target:
+        description: 'Target/subtarget SDK'
+        required: true
+        default: 'mediatek/filogic'
+      release:
+        description: 'Создать GitHub Release с пакетом'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  PACKAGE_NAME: xray-core
+  BIN_NAME: openwrt-xray
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      VER: ${{ inputs.openwrt_version }}
+      TARGET: ${{ inputs.target }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ccache gettext libncurses5-dev xsltproc zstd
+
+      - name: Download SDK
+        run: |
+          URL="https://downloads.openwrt.org/releases/${VER}/targets/${TARGET}"
+          SDK_NAME="-sdk-${VER}-$(echo "$TARGET" | tr / -)_"
+          wget -q -O - "$URL/sha256sums" | grep -- "$SDK_NAME" > sha256sums.small
+          test -s sha256sums.small || { echo "::error::SDK $SDK_NAME не найден в $URL"; exit 1; }
+          SDK_FILE="$(cut -d' ' -f2 sha256sums.small | sed 's/*//')"
+          wget -q "$URL/$SDK_FILE"
+          sha256sum -c sha256sums.small
+          echo "SDK_HOME=$(mktemp -d)" >> "$GITHUB_ENV"
+          echo "SDK_FILE=$SDK_FILE" >> "$GITHUB_ENV"
+
+      - name: Unpack SDK and feeds
+        run: |
+          tar -C "$SDK_HOME" --strip=1 -xf "$SDK_FILE"
+          cd "$SDK_HOME"
+          cp feeds.conf.default feeds.conf
+          sed -i 's#git.openwrt.org/openwrt/openwrt#github.com/openwrt/openwrt#;
+                  s#git.openwrt.org/feed/packages#github.com/openwrt/packages#;
+                  s#git.openwrt.org/project/luci#github.com/openwrt/luci#;
+                  s#git.openwrt.org/feed/telephony#github.com/openwrt/telephony#' feeds.conf
+          ./scripts/feeds update -a
+          rm -rf "feeds/packages/net/$PACKAGE_NAME" feeds/packages/lang/golang
+          curl -sL https://codeload.github.com/openwrt/packages/tar.gz/master \
+            | tar -xz -C feeds/packages/lang --strip=2 packages-master/lang/golang
+          ln -s "$GITHUB_WORKSPACE" "package/$PACKAGE_NAME"
+          ./scripts/feeds install -a
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build
+        run: |
+          cd "$SDK_HOME"
+          make defconfig
+          make package/$PACKAGE_NAME/{clean,compile} V=s -j$(nproc)
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find bin/ -type f \( -name "${BIN_NAME}*.ipk" -o -name "${BIN_NAME}*.apk" \) \
+            -exec cp {} "$GITHUB_WORKSPACE/out/" \;
+          ls -lh "$GITHUB_WORKSPACE/out"
+          PKG_VERSION=$(grep '^PKG_VERSION' "$GITHUB_WORKSPACE/Makefile" | cut -d= -f2)
+          echo "TAG=v${PKG_VERSION}-openwrt-${VER}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-xray-${{ env.VER }}
+          path: out/*
+
+      - name: Release
+        if: ${{ inputs.release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          files: out/*
