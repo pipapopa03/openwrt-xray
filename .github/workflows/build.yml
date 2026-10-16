@@ -11,6 +11,10 @@ on:
         description: 'Target/subtarget SDK'
         required: true
         default: 'mediatek/filogic'
+      xray_version:
+        description: 'Версия Xray-core (тег без v). Пусто = из Makefile'
+        required: false
+        default: '26.10.10'
       release:
         description: 'Создать GitHub Release с пакетом'
         type: boolean
@@ -32,6 +36,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set Xray version
+        if: ${{ inputs.xray_version != '' }}
+        run: |
+          ./update.sh "${{ inputs.xray_version }}"
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
+          if ! git diff --quiet Makefile; then
+            git commit -am "Xray ${{ inputs.xray_version }}"
+            git push
+          fi
 
       - name: Install dependencies
         run: |
