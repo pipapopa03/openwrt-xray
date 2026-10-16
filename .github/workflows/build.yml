@@ -59,7 +59,15 @@ jobs:
         run: |
           V="${{ inputs.xray_version }}"
           if [ -z "$V" ]; then
-            V=$(gh api repos/XTLS/Xray-core/releases/latest --jq .tag_name)
+            # XTLS помечает почти все свежие релизы как pre-release, а "latest" у них
+            # бывает на полгода старше. Берём самый новый неdraft-релиз по номеру версии.
+            V=$(gh api 'repos/XTLS/Xray-core/releases?per_page=50' \
+                  --jq '.[] | select(.draft == false) | .tag_name' \
+                | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            test -n "$V" || { echo "::error::не удалось получить версию Xray"; exit 1; }
+            # не откатываемся ниже версии, уже записанной в Makefile
+            CUR=$(grep '^PKG_VERSION' Makefile | cut -d= -f2)
+            V=$(printf '%s\n%s\n' "$V" "$CUR" | sort -V | tail -1)
           fi
           V="${V#v}"
           echo "Xray: $V"
