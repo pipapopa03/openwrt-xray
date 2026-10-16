@@ -1,52 +1,131 @@
-name: Build xray for OpenWrt (filogic / aarch64_cortex-a53)
+name: Build xray for OpenWrt
+
+# Раз в день: берёт последний релиз Xray-core и последние версии OpenWrt
+# (по одной из N свежих веток), собирает то, чего ещё нет в Releases.
+# Один Release на версию Xray (тег vX.Y.Z), внутри пакеты под каждую версию OpenWrt.
 
 on:
+  schedule:
+    - cron: '17 4 * * *'   # 07:17 МСК
   workflow_dispatch:
     inputs:
-      openwrt_version:
-        description: 'Версия OpenWrt (как в /etc/openwrt_release), напр. 25.12.5 или 24.10.4'
-        required: true
-        default: '25.12.5'
+      xray_version:
+        description: 'Версия Xray-core (без v). Пусто = последний релиз'
+        required: false
+        default: ''
+      openwrt_versions:
+        description: 'Версии OpenWrt через пробел (напр. "24.10.4 25.12.5"). Пусто = авто'
+        required: false
+        default: ''
+      openwrt_series:
+        description: 'Авто-режим: сколько последних веток OpenWrt собирать'
+        required: false
+        default: '2'
       target:
         description: 'Target/subtarget SDK'
-        required: true
-        default: 'mediatek/filogic'
-      xray_version:
-        description: 'Версия Xray-core (тег без v). Пусто = из Makefile'
         required: false
-        default: '26.10.10'
-      release:
-        description: 'Создать GitHub Release с пакетом'
+        default: 'mediatek/filogic'
+      force:
+        description: 'Пересобрать, даже если пакет уже есть в релизе'
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-xray
+  cancel-in-progress: false
+
 env:
   PACKAGE_NAME: xray-core
   BIN_NAME: openwrt-xray
+  TARGET: ${{ inputs.target || 'mediatek/filogic' }}
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-latest
-    env:
-      VER: ${{ inputs.openwrt_version }}
-      TARGET: ${{ inputs.target }}
+    outputs:
+      xray: ${{ steps.xray.outputs.version }}
+      sha: ${{ steps.bump.outputs.sha }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      empty: ${{ steps.matrix.outputs.empty }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set Xray version
-        if: ${{ inputs.xray_version != '' }}
+      - name: Resolve Xray version
+        id: xray
         run: |
-          ./update.sh "${{ inputs.xray_version }}"
-          git config user.name github-actions
-          git config user.email github-actions@users.noreply.github.com
-          if ! git diff --quiet Makefile; then
-            git commit -am "Xray ${{ inputs.xray_version }}"
+          V="${{ inputs.xray_version }}"
+          if [ -z "$V" ]; then
+            V=$(gh api repos/XTLS/Xray-core/releases/latest --jq .tag_name)
+          fi
+          V="${V#v}"
+          echo "Xray: $V"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Bump Makefile
+        id: bump
+        run: |
+          V="${{ steps.xray.outputs.version }}"
+          CUR=$(grep '^PKG_VERSION' Makefile | cut -d= -f2)
+          if [ "$CUR" != "$V" ]; then
+            ./update.sh "$V"
+            git config user.name github-actions
+            git config user.email github-actions@users.noreply.github.com
+            git commit -am "Xray $V"
             git push
           fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build matrix
+        id: matrix
+        run: |
+          V="${{ steps.xray.outputs.version }}"
+          VERS="${{ inputs.openwrt_versions }}"
+          if [ -z "$VERS" ]; then
+            VERS=$(python3 .github/scripts/openwrt_versions.py "${{ inputs.openwrt_series || '2' }}")
+          fi
+          echo "OpenWrt: $VERS"
+          ASSETS=$(gh release view "v$V" --json assets --jq '.assets[].name' 2>/dev/null || true)
+          TODO=""
+          for W in $VERS; do
+            if [ "${{ inputs.force }}" != "true" ] && echo "$ASSETS" | grep -q "_openwrt-${W}\."; then
+              echo "skip $W: уже в релизе v$V"
+            else
+              TODO="$TODO $W"
+            fi
+          done
+          MATRIX=$(python3 -c 'import json,sys; print(json.dumps({"openwrt": sys.argv[1:]}))' $TODO)
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          [ -z "$TODO" ] && echo "empty=true" >> "$GITHUB_OUTPUT" || echo "empty=false" >> "$GITHUB_OUTPUT"
+          echo "matrix: $MATRIX"
+
+      - name: Ensure release exists
+        if: steps.matrix.outputs.empty == 'false'
+        run: |
+          V="${{ steps.xray.outputs.version }}"
+          gh release view "v$V" >/dev/null 2>&1 || \
+            gh release create "v$V" --target "${{ steps.bump.outputs.sha }}" \
+              --title "Xray $V" \
+              --notes "Xray-core [$V](https://github.com/XTLS/Xray-core/releases/tag/v$V) для OpenWrt, target \`$TARGET\`. 25.12+: \`apk add --allow-untrusted\`, 24.10: \`opkg install\`."
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.empty == 'false'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    name: OpenWrt ${{ matrix.openwrt }}
+    env:
+      VER: ${{ matrix.openwrt }}
+      XRAY: ${{ needs.prepare.outputs.xray }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - name: Install dependencies
         run: |
@@ -54,11 +133,18 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             ccache gettext libncurses5-dev xsltproc zstd
 
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/dl
+          key: dl-${{ env.VER }}-${{ env.XRAY }}
+          restore-keys: dl-${{ env.VER }}-
+
       - name: Download SDK
         run: |
           URL="https://downloads.openwrt.org/releases/${VER}/targets/${TARGET}"
           SDK_NAME="-sdk-${VER}-$(echo "$TARGET" | tr / -)_"
-          wget -q -O - "$URL/sha256sums" | grep -- "$SDK_NAME" > sha256sums.small
+          wget -q -O - "$URL/sha256sums" | grep -- "$SDK_NAME" > sha256sums.small || true
           test -s sha256sums.small || { echo "::error::SDK $SDK_NAME не найден в $URL"; exit 1; }
           SDK_FILE="$(cut -d' ' -f2 sha256sums.small | sed 's/*//')"
           wget -q "$URL/$SDK_FILE"
@@ -69,7 +155,9 @@ jobs:
       - name: Unpack SDK and feeds
         run: |
           tar -C "$SDK_HOME" --strip=1 -xf "$SDK_FILE"
+          rm -f "$SDK_FILE"
           cd "$SDK_HOME"
+          mkdir -p ~/dl && rm -rf dl && ln -s ~/dl dl
           cp feeds.conf.default feeds.conf
           sed -i 's#git.openwrt.org/openwrt/openwrt#github.com/openwrt/openwrt#;
                   s#git.openwrt.org/feed/packages#github.com/openwrt/packages#;
@@ -92,23 +180,20 @@ jobs:
           cd "$SDK_HOME"
           make defconfig
           make package/$PACKAGE_NAME/{clean,compile} V=s -j$(nproc)
+          ARCH=$(grep '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d'"' -f2)
           mkdir -p "$GITHUB_WORKSPACE/out"
-          find bin/ -type f \( -name "${BIN_NAME}*.ipk" -o -name "${BIN_NAME}*.apk" \) \
-            -exec cp {} "$GITHUB_WORKSPACE/out/" \;
+          find bin/ -type f \( -name "${BIN_NAME}*.ipk" -o -name "${BIN_NAME}*.apk" \) | while read -r f; do
+            ext="${f##*.}"
+            cp "$f" "$GITHUB_WORKSPACE/out/${BIN_NAME}_${XRAY}_${ARCH}_openwrt-${VER}.${ext}"
+          done
           ls -lh "$GITHUB_WORKSPACE/out"
-          PKG_VERSION=$(grep '^PKG_VERSION' "$GITHUB_WORKSPACE/Makefile" | cut -d= -f2)
-          echo "TAG=v${PKG_VERSION}-openwrt-${VER}" >> "$GITHUB_ENV"
+          test -n "$(ls "$GITHUB_WORKSPACE/out")"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-xray-${{ env.VER }}
+          name: openwrt-xray-${{ env.XRAY }}-openwrt-${{ env.VER }}
           path: out/*
 
-      - name: Release
-        if: ${{ inputs.release }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG }}
-          name: ${{ env.TAG }}
-          files: out/*
+      - name: Upload to release
+        run: gh release upload "v$XRAY" out/* --clobber
